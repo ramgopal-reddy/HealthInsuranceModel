@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 python-docx
-fitz
+pymupdf
 faiss-cpu
 python-dotenv
 requests
