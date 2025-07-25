@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 import os
 import requests
-import fitz  # PyMuPDF
+import fitz  # from PyMuPDF
 from docx import Document
 import faiss
 import numpy as np
@@ -12,6 +12,7 @@ import json
 import re
 from email import message_from_bytes
 from io import BytesIO
+from urllib.parse import urlparse
 
 # Load environment variables
 load_dotenv()
@@ -19,29 +20,35 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise ValueError("Missing GOOGLE_API_KEY in .env")
 
+# Configure Gemini
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
 # Bearer token for validation
 API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
 
-app = FastAPI(title="LLM Insurance Assistant")
+# FastAPI app
+app = FastAPI(title="LLM-Powered Query System")
 
-# ---------------------------------------
-# Data Models
-# ---------------------------------------
+# -------------------------
+# Models
+# -------------------------
 
 class RunRequest(BaseModel):
-    documents: str  # Blob URL (PDF, DOCX, EML)
+    documents: str
     questions: list[str]
 
-# ---------------------------------------
-# Utility Functions
-# ---------------------------------------
+# -------------------------
+# Token Auth
+# -------------------------
 
 def check_token(auth_header: str):
     if not auth_header.startswith("Bearer ") or auth_header.split(" ")[1] != API_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid or missing authorization token")
+
+# -------------------------
+# Document Extractors
+# -------------------------
 
 def extract_text_from_pdf_url(url):
     response = requests.get(url)
@@ -65,14 +72,19 @@ def extract_text_from_eml_url(url):
     return msg.get_payload()
 
 def get_text_from_blob(url):
-    if url.endswith(".pdf"):
+    path = urlparse(url).path.lower()
+    if path.endswith(".pdf"):
         return extract_text_from_pdf_url(url)
-    elif url.endswith(".docx"):
+    elif path.endswith(".docx"):
         return extract_text_from_docx_url(url)
-    elif url.endswith(".eml"):
+    elif path.endswith(".eml"):
         return extract_text_from_eml_url(url)
     else:
         raise ValueError("Unsupported file format (must be PDF, DOCX, or EML)")
+
+# -------------------------
+# Embeddings & FAISS
+# -------------------------
 
 def chunk_text(text, max_words=200):
     words = text.split()
@@ -96,6 +108,10 @@ def get_top_k_chunks(query, chunks, embeddings, index, k=5):
     query_vector = np.array(embed_text(query, "retrieval_query")).astype("float32").reshape(1, -1)
     _, I = index.search(query_vector, k)
     return [chunks[i] for i in I[0]]
+
+# -------------------------
+# Gemini Response
+# -------------------------
 
 def generate_decision(user_query, retrieved_clauses):
     prompt = f"""
@@ -129,9 +145,9 @@ def parse_json_from_response(response_text):
     except:
         return {"error": "Failed to parse Gemini response", "raw": response_text}
 
-# ---------------------------------------
-# API ROUTES
-# ---------------------------------------
+# -------------------------
+# Routes
+# -------------------------
 
 @app.get("/")
 def root():
@@ -142,10 +158,12 @@ def run_handler(request: RunRequest, authorization: str = Header(...)):
     check_token(authorization)
     
     try:
+        # Load and chunk document
         text = get_text_from_blob(request.documents)
         chunks = chunk_text(text)
         index, embeddings = build_faiss_index(chunks)
 
+        # Process questions
         answers = []
         for question in request.questions:
             top_chunks = get_top_k_chunks(question, chunks, embeddings, index)
