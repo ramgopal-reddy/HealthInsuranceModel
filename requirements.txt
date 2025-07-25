@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-docx
+fitz
+faiss-cpu
+python-dotenv
+requests
+numpy
+google-generativeai
+scikit-learn
