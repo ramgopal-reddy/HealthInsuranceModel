@@ -1,34 +1,35 @@
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-import os
-import requests
-import fitz  # from PyMuPDF
-from docx import Document
-import faiss
-import numpy as np
-import google.generativeai as genai
-from dotenv import load_dotenv
-import json
-import re
-from email import message_from_bytes
-from io import BytesIO
 from urllib.parse import urlparse
+from hashlib import sha256
+from dotenv import load_dotenv
+from email import message_from_bytes
+from docx import Document
+import google.generativeai as genai
+import numpy as np
+import faiss
+import fitz  # PyMuPDF
+import requests
+import json
+import os
+import re
+from io import BytesIO
+import concurrent.futures
 
 # Load environment variables
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
-    raise ValueError("Missing GOOGLE_API_KEY in .env")
+    raise ValueError("Missing GOOGLE_API_KEY")
 
-# Configure Gemini
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
-# Bearer token for validation
 API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
-
-# FastAPI app
 app = FastAPI(title="LLM-Powered Query System")
+
+# In-memory cache to speed up repeated document loads
+DOC_CACHE = {}
 
 # -------------------------
 # Models
@@ -39,35 +40,31 @@ class RunRequest(BaseModel):
     questions: list[str]
 
 # -------------------------
-# Token Auth
+# Utils
 # -------------------------
 
 def check_token(auth_header: str):
     if not auth_header.startswith("Bearer ") or auth_header.split(" ")[1] != API_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid or missing authorization token")
 
-# -------------------------
-# Document Extractors
-# -------------------------
+def compute_url_hash(url: str) -> str:
+    return sha256(url.encode()).hexdigest()
 
 def extract_text_from_pdf_url(url):
     response = requests.get(url)
-    if response.status_code != 200:
-        raise ValueError("Failed to download PDF")
+    response.raise_for_status()
     doc = fitz.open(stream=BytesIO(response.content), filetype="pdf")
-    return "\n".join([page.get_text() for page in doc])
+    return "\n".join(page.get_text() for page in doc)
 
 def extract_text_from_docx_url(url):
     response = requests.get(url)
-    if response.status_code != 200:
-        raise ValueError("Failed to download DOCX")
+    response.raise_for_status()
     doc = Document(BytesIO(response.content))
-    return "\n".join([para.text for para in doc.paragraphs])
+    return "\n".join(para.text for para in doc.paragraphs)
 
 def extract_text_from_eml_url(url):
     response = requests.get(url)
-    if response.status_code != 200:
-        raise ValueError("Failed to download EML")
+    response.raise_for_status()
     msg = message_from_bytes(response.content)
     return msg.get_payload()
 
@@ -83,14 +80,14 @@ def get_text_from_blob(url):
         raise ValueError("Unsupported file format (must be PDF, DOCX, or EML)")
 
 # -------------------------
-# Embeddings & FAISS
+# Embedding & Retrieval
 # -------------------------
 
 def chunk_text(text, max_words=200):
     words = text.split()
     return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
 
-def embed_text(text, task_type):
+def embed_text(text, task_type="retrieval_document"):
     return genai.embed_content(
         model="models/embedding-001",
         content=text,
@@ -135,8 +132,11 @@ You are a health insurance assistant. Based on the user query and the retrieved 
   "justification": "clear reason based on clause"
 }}
 """
-    response = model.generate_content(prompt)
-    return parse_json_from_response(response.text)
+    try:
+        response = model.generate_content(prompt)
+        return parse_json_from_response(response.text)
+    except Exception as e:
+        return {"error": f"Gemini error: {str(e)}"}
 
 def parse_json_from_response(response_text):
     try:
@@ -146,7 +146,7 @@ def parse_json_from_response(response_text):
         return {"error": "Failed to parse Gemini response", "raw": response_text}
 
 # -------------------------
-# Routes
+# FastAPI Routes
 # -------------------------
 
 @app.get("/")
@@ -156,22 +156,28 @@ def root():
 @app.post("/hackrx/run")
 def run_handler(request: RunRequest, authorization: str = Header(...)):
     check_token(authorization)
-    
-    try:
-        # Load and chunk document
-        text = get_text_from_blob(request.documents)
-        chunks = chunk_text(text)
-        index, embeddings = build_faiss_index(chunks)
 
-        # Process questions
-        answers = []
-        for question in request.questions:
-            top_chunks = get_top_k_chunks(question, chunks, embeddings, index)
+    try:
+        doc_id = compute_url_hash(request.documents)
+
+        if doc_id in DOC_CACHE:
+            chunks, index, embeddings = DOC_CACHE[doc_id]
+        else:
+            raw_text = get_text_from_blob(request.documents)
+            chunks = chunk_text(raw_text)
+            index, embeddings = build_faiss_index(chunks)
+            DOC_CACHE[doc_id] = (chunks, index, embeddings)
+
+        def handle_question(q):
+            top_chunks = get_top_k_chunks(q, chunks, embeddings, index)
             context = "\n\n".join(top_chunks)
-            decision = generate_decision(question, context)
-            answers.append(decision)
+            return generate_decision(q, context)
+
+        # Parallelize for multiple questions
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            answers = list(executor.map(handle_question, request.questions))
 
         return {"answers": answers}
-    
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
