@@ -110,7 +110,7 @@ def build_or_load_faiss(doc_text: str):
         return chunks, index
 
     chunks = chunk_text(doc_text)
-    chunks = chunks[:40]  # ⚡ limit to 40 chunks max for speed
+    chunks = chunks[:40]  # ⚡ Limit to 40 chunks for performance
 
     embeddings = [embed_text(c) for c in chunks]
     dim = len(embeddings[0])
@@ -180,14 +180,15 @@ def run_handler(request: RunRequest, authorization: str = Header(...)):
     check_token(authorization)
 
     try:
-        # Load + process doc
         text = get_text_from_blob(request.documents)
         chunks, index = build_or_load_faiss(text)
 
-        # Answer questions in parallel
         def handle_question(q):
             context = "\n\n".join(get_top_k_chunks(q, chunks, index))
-            return generate_decision(q, context)
+            result = generate_decision(q, context)
+            if "error" in result:
+                return f"Error processing: {result.get('error', result.get('raw'))}"
+            return result.get("justification", "No answer found.")
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(handle_question, request.questions))
