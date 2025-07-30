@@ -21,16 +21,18 @@ import pickle
 
 load_dotenv()
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+API_TOKEN = os.getenv("API_TOKEN", "default_dev_token")
+
+if not GOOGLE_API_KEY:
+    raise ValueError("Missing GOOGLE_API_KEY")
 if not OPENROUTER_API_KEY:
     raise ValueError("Missing OPENROUTER_API_KEY")
 
-API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
+genai.configure(api_key=GOOGLE_API_KEY)
 
-# Cache folder for FAISS indexes
 os.makedirs("faiss_indexes", exist_ok=True)
-
-
 
 app = FastAPI(title="LLM-Powered Insurance API")
 
@@ -129,7 +131,7 @@ def get_top_k_chunks(query, chunks, index, k=5):
     return [chunks[i] for i in I[0]]
 
 # -------------------------
-# Gemini Generator
+# Decision Generator (OpenRouter + DeepSeek)
 # -------------------------
 
 def generate_decision(user_query, retrieved_clauses):
@@ -154,14 +156,13 @@ You are a health insurance assistant. Based on the user query and the retrieved 
   "justification": "reason based on clause"
 }}
 """
-
     try:
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
         }
         payload = {
-            "model": "deepseek-chat",  # or try "deepseek-coder" if needed
+            "model": "deepseek-chat",
             "messages": [
                 {"role": "system", "content": "You are a helpful insurance assistant."},
                 {"role": "user", "content": prompt}
@@ -170,12 +171,15 @@ You are a health insurance assistant. Based on the user query and the retrieved 
         }
         response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
         response.raise_for_status()
-        reply = response.json()["choices"][0]["message"]["content"]
+        res_json = response.json()
+        if not res_json.get("choices"):
+            return {"error": "No response from model", "raw": res_json}
+
+        reply = res_json["choices"][0]["message"]["content"]
         return parse_json(reply)
 
     except Exception as e:
         return {"error": str(e)}
-
 
 def parse_json(text):
     try:
