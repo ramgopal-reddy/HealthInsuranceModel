@@ -20,17 +20,16 @@ import pickle
 # -------------------------
 
 load_dotenv()
-
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
-
 if not GOOGLE_API_KEY:
     raise ValueError("Missing GOOGLE_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise ValueError("Missing OPENROUTER_API_KEY")
 
 genai.configure(api_key=GOOGLE_API_KEY)
+model = genai.GenerativeModel("gemini-2.5-flash")
+
+API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
+
+# Cache folder for FAISS indexes
 os.makedirs("faiss_indexes", exist_ok=True)
 
 app = FastAPI(title="LLM-Powered Insurance API")
@@ -130,7 +129,7 @@ def get_top_k_chunks(query, chunks, index, k=5):
     return [chunks[i] for i in I[0]]
 
 # -------------------------
-# Decision Generator (OpenRouter + DeepSeek)
+# Gemini Generator
 # -------------------------
 
 def generate_decision(user_query, retrieved_clauses):
@@ -156,31 +155,8 @@ You are a health insurance assistant. Based on the user query and the retrieved 
 }}
 """
     try:
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        payload = {
-            "model": "deepseek/deepseek-chat-v3-0324:free",
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        }
-
-        response = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            data=json.dumps(payload)
-        )
-        response.raise_for_status()
-        res_json = response.json()
-        if not res_json.get("choices"):
-            return {"error": "No response from model", "raw": res_json}
-
-        reply = res_json["choices"][0]["message"]["content"]
-        return parse_json(reply)
-
+        res = model.generate_content(prompt)
+        return parse_json(res.text)
     except Exception as e:
         return {"error": str(e)}
 
