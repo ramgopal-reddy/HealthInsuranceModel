@@ -1,25 +1,37 @@
-import os, re, json, pickle, requests
+import os, re, json
 from urllib.parse import urlparse
 from hashlib import sha256
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from docx import Document
 from email import message_from_bytes
+from dotenv import load_dotenv
 from io import BytesIO
+import requests
 import fitz  # PyMuPDF
 import numpy as np
 import faiss
+import google.generativeai as genai
 import concurrent.futures
+import pickle
 
 # -------------------------
-# HARDCODED KEYS
+# Init + Config
 # -------------------------
-HF_TOKEN = "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"
-OPENROUTER_API_KEY = "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"
-HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+load_dotenv()
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise ValueError("Missing OPENROUTER_API_KEY")
+
 API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
 
+# Cache folder for FAISS indexes
 os.makedirs("faiss_indexes", exist_ok=True)
+
+
+
 app = FastAPI(title="LLM-Powered Insurance API")
 
 # -------------------------
@@ -72,28 +84,19 @@ def get_text_from_blob(url):
         raise ValueError("Unsupported file format (must be PDF, DOCX, or EML)")
 
 # -------------------------
-# Embedding + FAISS
+# Embedding + Retrieval
 # -------------------------
 
 def chunk_text(text, max_words=200):
     words = text.split()
     return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
 
-def embed_text(texts):
-    if isinstance(texts, str):
-        texts = [texts]
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    response = requests.post(
-        f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL}",
-        headers=headers,
-        json={"inputs": texts},
-        timeout=15
-    )
-    response.raise_for_status()
-    return response.json()
+def embed_text(text, task_type="retrieval_document"):
+    return genai.embed_content(
+        model="models/embedding-001",
+        content=text,
+        task_type=task_type
+    )['embedding']
 
 def build_or_load_faiss(doc_text: str):
     doc_id = compute_hash(doc_text)
@@ -107,9 +110,9 @@ def build_or_load_faiss(doc_text: str):
         return chunks, index
 
     chunks = chunk_text(doc_text)
-    chunks = chunks[:40]  # limit for performance
+    chunks = chunks[:40]  # ⚡ Limit to 40 chunks for performance
 
-    embeddings = embed_text(chunks)
+    embeddings = [embed_text(c) for c in chunks]
     dim = len(embeddings[0])
     index = faiss.IndexFlatL2(dim)
     index.add(np.array(embeddings).astype("float32"))
@@ -121,12 +124,12 @@ def build_or_load_faiss(doc_text: str):
     return chunks, index
 
 def get_top_k_chunks(query, chunks, index, k=5):
-    query_vec = np.array(embed_text(query)).astype("float32").reshape(1, -1)
+    query_vec = np.array(embed_text(query, "retrieval_query")).astype("float32").reshape(1, -1)
     _, I = index.search(query_vec, k)
     return [chunks[i] for i in I[0]]
 
 # -------------------------
-# OpenRouter LLM
+# Gemini Generator
 # -------------------------
 
 def generate_decision(user_query, retrieved_clauses):
@@ -151,32 +154,34 @@ You are a health insurance assistant. Based on the user query and the retrieved 
   "justification": "reason based on clause"
 }}
 """
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://render.com",
-        "X-Title": "HackRxBot"
-    }
-    body = {
-        "model": "mistralai/mixtral-8x7b",
-        "messages": [
-            {"role": "system", "content": "You are a helpful insurance assistant."},
-            {"role": "user", "content": prompt}
-        ]
-    }
+
     try:
-        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=30)
-        res.raise_for_status()
-        message = res.json()["choices"][0]["message"]["content"]
-        return parse_json(message)
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "deepseek-chat",  # or try "deepseek-coder" if needed
+            "messages": [
+                {"role": "system", "content": "You are a helpful insurance assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3
+        }
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+        response.raise_for_status()
+        reply = response.json()["choices"][0]["message"]["content"]
+        return parse_json(reply)
+
     except Exception as e:
         return {"error": str(e)}
+
 
 def parse_json(text):
     try:
         json_str = re.search(r'{.*}', text, re.DOTALL).group()
         return json.loads(json_str)
-    except Exception:
+    except:
         return {"error": "Invalid JSON", "raw": text}
 
 # -------------------------
@@ -185,11 +190,7 @@ def parse_json(text):
 
 @app.get("/")
 def home():
-    return {
-        "status": "LLM-Powered Insurance API running",
-        "hf": True,
-        "openrouter": True
-    }
+    return {"status": "LLM-Powered Insurance API running."}
 
 @app.post("/hackrx/run")
 def run_handler(request: RunRequest, authorization: str = Header(...)):
@@ -203,8 +204,8 @@ def run_handler(request: RunRequest, authorization: str = Header(...)):
             context = "\n\n".join(get_top_k_chunks(q, chunks, index))
             result = generate_decision(q, context)
             if "error" in result:
-                return f"Error: {result['error']}"
-            return result.get("justification", "No answer")
+                return f"Error processing: {result.get('error', result.get('raw'))}"
+            return result.get("justification", "No answer found.")
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(handle_question, request.questions))
