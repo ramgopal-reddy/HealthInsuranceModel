@@ -31,7 +31,6 @@ if not OPENROUTER_API_KEY:
     raise ValueError("Missing OPENROUTER_API_KEY")
 
 genai.configure(api_key=GOOGLE_API_KEY)
-
 os.makedirs("faiss_indexes", exist_ok=True)
 
 app = FastAPI(title="LLM-Powered Insurance API")
@@ -161,15 +160,19 @@ You are a health insurance assistant. Based on the user query and the retrieved 
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
         }
+
         payload = {
-            "model": "deepseek-chat",
+            "model": "deepseek/deepseek-chat-v3-0324:free",
             "messages": [
-                {"role": "system", "content": "You are a helpful insurance assistant."},
                 {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.3
+            ]
         }
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            data=json.dumps(payload)
+        )
         response.raise_for_status()
         res_json = response.json()
         if not res_json.get("choices"):
