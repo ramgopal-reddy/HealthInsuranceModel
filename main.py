@@ -1,44 +1,39 @@
-import os, re, json, requests, pickle
-from hashlib import sha256
+import os, re, json, pickle, requests
 from urllib.parse import urlparse
-from io import BytesIO
+from hashlib import sha256
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from docx import Document
 from email import message_from_bytes
+from io import BytesIO
 import fitz  # PyMuPDF
 import numpy as np
 import faiss
 import concurrent.futures
-from dotenv import load_dotenv
 
-# ----------------------------
-# Load secrets / config
-# ----------------------------
-load_dotenv()
-HF_TOKEN = os.getenv("HF_API_TOKEN", "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")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "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")
-
+# -------------------------
+# HARDCODED KEYS
+# -------------------------
+HF_TOKEN = "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"
+OPENROUTER_API_KEY = "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"
+HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
-HF_EMBED_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
 
 os.makedirs("faiss_indexes", exist_ok=True)
-
-# ----------------------------
-# FastAPI Init
-# ----------------------------
 app = FastAPI(title="LLM-Powered Insurance API")
 
-# ----------------------------
+# -------------------------
 # Models
-# ----------------------------
+# -------------------------
+
 class RunRequest(BaseModel):
     documents: str
     questions: list[str]
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# -------------------------
+# Auth + Utils
+# -------------------------
+
 def check_token(auth_header: str):
     if not auth_header.startswith("Bearer ") or auth_header.split(" ")[1] != API_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid or missing token")
@@ -46,9 +41,10 @@ def check_token(auth_header: str):
 def compute_hash(text: str):
     return sha256(text.encode()).hexdigest()
 
-# ----------------------------
-# Document Extractors
-# ----------------------------
+# -------------------------
+# Document Parsers
+# -------------------------
+
 def extract_text_from_pdf_url(url):
     r = requests.get(url); r.raise_for_status()
     doc = fitz.open(stream=BytesIO(r.content), filetype="pdf")
@@ -75,32 +71,29 @@ def get_text_from_blob(url):
     else:
         raise ValueError("Unsupported file format (must be PDF, DOCX, or EML)")
 
-# ----------------------------
-# Embeddings (via HF API)
-# ----------------------------
+# -------------------------
+# Embedding + FAISS
+# -------------------------
+
+def chunk_text(text, max_words=200):
+    words = text.split()
+    return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
+
 def embed_text(texts):
     if isinstance(texts, str):
         texts = [texts]
-
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json"
     }
-
-    try:
-        resp = requests.post(HF_EMBED_URL, headers=headers, json={"inputs": texts}, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"[Embedding Error] {e}")
-        return [np.random.rand(384).tolist() for _ in texts]
-
-# ----------------------------
-# Chunking & FAISS
-# ----------------------------
-def chunk_text(text, max_words=200):
-    words = text.split()
-    return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
+    response = requests.post(
+        f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL}",
+        headers=headers,
+        json={"inputs": texts},
+        timeout=15
+    )
+    response.raise_for_status()
+    return response.json()
 
 def build_or_load_faiss(doc_text: str):
     doc_id = compute_hash(doc_text)
@@ -114,7 +107,7 @@ def build_or_load_faiss(doc_text: str):
         return chunks, index
 
     chunks = chunk_text(doc_text)
-    chunks = chunks[:40]  # ⚡ Limit to 40 for speed
+    chunks = chunks[:40]  # limit for performance
 
     embeddings = embed_text(chunks)
     dim = len(embeddings[0])
@@ -132,9 +125,10 @@ def get_top_k_chunks(query, chunks, index, k=5):
     _, I = index.search(query_vec, k)
     return [chunks[i] for i in I[0]]
 
-# ----------------------------
-# Generation (via OpenRouter)
-# ----------------------------
+# -------------------------
+# OpenRouter LLM
+# -------------------------
+
 def generate_decision(user_query, retrieved_clauses):
     prompt = f"""
 You are a health insurance assistant. Based on the user query and the retrieved policy clauses, make a decision.
@@ -157,25 +151,24 @@ You are a health insurance assistant. Based on the user query and the retrieved 
   "justification": "reason based on clause"
 }}
 """
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
+        "HTTP-Referer": "https://render.com",
+        "X-Title": "HackRxBot"
     }
-
     body = {
-        "model": "deepseek-chat",  # or another OpenRouter-supported model
+        "model": "mistralai/mixtral-8x7b",
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "You are a helpful insurance assistant."},
             {"role": "user", "content": prompt}
         ]
     }
-
     try:
         res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=30)
         res.raise_for_status()
-        response_text = res.json()['choices'][0]['message']['content']
-        return parse_json(response_text)
+        message = res.json()["choices"][0]["message"]["content"]
+        return parse_json(message)
     except Exception as e:
         return {"error": str(e)}
 
@@ -183,15 +176,20 @@ def parse_json(text):
     try:
         json_str = re.search(r'{.*}', text, re.DOTALL).group()
         return json.loads(json_str)
-    except:
+    except Exception:
         return {"error": "Invalid JSON", "raw": text}
 
-# ----------------------------
-# API Routes
-# ----------------------------
+# -------------------------
+# FastAPI Routes
+# -------------------------
+
 @app.get("/")
 def home():
-    return {"status": "LLM API running"}
+    return {
+        "status": "LLM-Powered Insurance API running",
+        "hf": True,
+        "openrouter": True
+    }
 
 @app.post("/hackrx/run")
 def run_handler(request: RunRequest, authorization: str = Header(...)):
@@ -205,8 +203,8 @@ def run_handler(request: RunRequest, authorization: str = Header(...)):
             context = "\n\n".join(get_top_k_chunks(q, chunks, index))
             result = generate_decision(q, context)
             if "error" in result:
-                return f"Error: {result.get('error', result.get('raw'))}"
-            return result
+                return f"Error: {result['error']}"
+            return result.get("justification", "No answer")
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(handle_question, request.questions))
