@@ -6,5 +6,5 @@ faiss-cpu
 python-dotenv
 requests
 numpy
-google-generativeai
 scikit-learn
+sentence-transformers
