@@ -23,7 +23,7 @@ load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-API_TOKEN = os.getenv("API_TOKEN", "default_dev_token")
+API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
 
 if not GOOGLE_API_KEY:
     raise ValueError("Missing GOOGLE_API_KEY")
