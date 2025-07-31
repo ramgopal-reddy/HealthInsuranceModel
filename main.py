@@ -13,7 +13,7 @@ import concurrent.futures
 from dotenv import load_dotenv
 
 # ----------------------------
-# Load secrets from .env
+# Load environment variables
 # ----------------------------
 load_dotenv()
 
@@ -25,17 +25,26 @@ if not HF_TOKEN:
 if not OPENROUTER_API_KEY:
     raise ValueError("Missing OPENROUTER_API_KEY")
 
+# Exposed as per your request
 API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
-HF_EMBED_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction"
 
 os.makedirs("faiss_indexes", exist_ok=True)
 
+# ----------------------------
+# FastAPI Init
+# ----------------------------
 app = FastAPI(title="LLM-Powered Insurance API")
 
+# ----------------------------
+# Models
+# ----------------------------
 class RunRequest(BaseModel):
     documents: str
     questions: list[str]
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def check_token(auth_header: str):
     if not auth_header.startswith("Bearer ") or auth_header.split(" ")[1] != API_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid or missing token")
@@ -43,6 +52,9 @@ def check_token(auth_header: str):
 def compute_hash(text: str):
     return sha256(text.encode()).hexdigest()
 
+# ----------------------------
+# Document Extractors
+# ----------------------------
 def extract_text_from_pdf_url(url):
     r = requests.get(url); r.raise_for_status()
     doc = fitz.open(stream=BytesIO(r.content), filetype="pdf")
@@ -69,6 +81,9 @@ def get_text_from_blob(url):
     else:
         raise ValueError("Unsupported file format (must be PDF, DOCX, or EML)")
 
+# ----------------------------
+# Embeddings (via HF API)
+# ----------------------------
 def embed_text(texts):
     if isinstance(texts, str):
         texts = [texts]
@@ -78,14 +93,21 @@ def embed_text(texts):
         "Content-Type": "application/json"
     }
 
+    API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction"
+
     try:
-        resp = requests.post(HF_EMBED_URL, headers=headers, json={"inputs": texts}, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        response = requests.post(API_URL, headers=headers, json={"inputs": texts}, timeout=15)
+        response.raise_for_status()
+        return response.json()  # returns list of embeddings
     except Exception as e:
         print(f"[Embedding Error] {e}")
+        # Fallback: generate random vector with same dim
         return [np.random.rand(384).tolist() for _ in texts]
 
+
+# ----------------------------
+# Chunking & FAISS
+# ----------------------------
 def chunk_text(text, max_words=200):
     words = text.split()
     return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
@@ -102,7 +124,7 @@ def build_or_load_faiss(doc_text: str):
         return chunks, index
 
     chunks = chunk_text(doc_text)
-    chunks = chunks[:40]  # Limit for speed
+    chunks = chunks[:40]  # Limit to 40 chunks for speed
 
     embeddings = embed_text(chunks)
     dim = len(embeddings[0])
@@ -120,17 +142,29 @@ def get_top_k_chunks(query, chunks, index, k=5):
     _, I = index.search(query_vec, k)
     return [chunks[i] for i in I[0]]
 
-def generate_answer(question, retrieved_clauses):
+# ----------------------------
+# Generation (via OpenRouter)
+# ----------------------------
+def generate_decision(user_query, retrieved_clauses):
     prompt = f"""
-You are a helpful insurance assistant. Answer the user's question based only on the provided insurance policy content.
+You are a health insurance assistant. Based on the user query and the retrieved policy clauses, make a decision.
 
-## Question:
-{question}
+## User Query:
+{user_query}
 
-## Policy Content:
+## Retrieved Clauses:
 {retrieved_clauses}
 
-If the answer is not available in the content, reply: "The policy document does not provide a clear answer to this question."
+## Task:
+1. Justify using exact clause references.
+2. Provide a clear decision based on the clauses.
+3. for multiple questions, provide a single JSON response with answers to all questions.
+4. If the answer is not found, return not found message.
+2. Return only JSON in format:
+
+{{
+    "reason based on clause"
+}}
 """
 
     headers = {
@@ -139,19 +173,31 @@ If the answer is not available in the content, reply: "The policy document does 
     }
 
     body = {
-        "model": "deepseek/deepseek-chat-v3-0324:free",
+        "model": "deepseek/deepseek-chat-v3-0324:free", 
         "messages": [
             {"role": "user", "content": prompt}
         ]
     }
 
     try:
-        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=30)
+        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(body), timeout=30)
         res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"].strip()
+        response_text = res.json()['choices'][0]['message']['content']
+        return parse_json(response_text)
     except Exception as e:
-        return f"Error: {str(e)}"
+        return {"error": str(e)}
 
+
+def parse_json(text):
+    try:
+        json_str = re.search(r'{.*}', text, re.DOTALL).group()
+        return json.loads(json_str)
+    except:
+        return {"error": "Invalid JSON", "raw": text}
+
+# ----------------------------
+# API Routes
+# ----------------------------
 @app.get("/")
 @app.head("/")
 def home():
@@ -167,7 +213,10 @@ def run_handler(request: RunRequest, authorization: str = Header(...)):
 
         def handle_question(q):
             context = "\n\n".join(get_top_k_chunks(q, chunks, index))
-            return generate_answer(q, context)
+            result = generate_decision(q, context)
+            if "error" in result:
+                return f"Error: {result.get('error', result.get('raw'))}"
+            return result
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(handle_question, request.questions))
