@@ -27,7 +27,6 @@ if not OPENROUTER_API_KEY:
 
 # Exposed as per your request
 API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
-HF_EMBED_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
 
 os.makedirs("faiss_indexes", exist_ok=True)
 
@@ -94,13 +93,17 @@ def embed_text(texts):
         "Content-Type": "application/json"
     }
 
+    API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction"
+
     try:
-        resp = requests.post(HF_EMBED_URL, headers=headers, json={"inputs": texts}, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        response = requests.post(API_URL, headers=headers, json={"inputs": texts}, timeout=15)
+        response.raise_for_status()
+        return response.json()  # returns list of embeddings
     except Exception as e:
         print(f"[Embedding Error] {e}")
+        # Fallback: generate random vector with same dim
         return [np.random.rand(384).tolist() for _ in texts]
+
 
 # ----------------------------
 # Chunking & FAISS
@@ -171,20 +174,20 @@ You are a health insurance assistant. Based on the user query and the retrieved 
     }
 
     body = {
-        "model": "deepseek-chat",  # or other OpenRouter-supported model
+        "model": "deepseek/deepseek-chat-v3-0324:free", 
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": prompt}
         ]
     }
 
     try:
-        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=30)
+        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(body), timeout=30)
         res.raise_for_status()
         response_text = res.json()['choices'][0]['message']['content']
         return parse_json(response_text)
     except Exception as e:
         return {"error": str(e)}
+
 
 def parse_json(text):
     try:
