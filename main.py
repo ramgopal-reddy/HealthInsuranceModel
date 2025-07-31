@@ -147,24 +147,19 @@ def get_top_k_chunks(query, chunks, index, k=5):
 # ----------------------------
 def generate_decision(user_query, retrieved_clauses):
     prompt = f"""
-You are a health insurance assistant. Based on the user query and the retrieved policy clauses, make a decision.
+You are a health insurance assistant. Read the user's query and the policy clauses, and answer clearly and accurately.
 
-## User Query:
+### User Query:
 {user_query}
 
-## Retrieved Clauses:
+### Relevant Policy Clauses:
 {retrieved_clauses}
 
-## Task:
-1. Justify using exact clause references.
-2. Provide a clear decision based on the clauses.
-3. for multiple questions, provide a single JSON response with answers to all questions.
-4. If the answer is not found, return not found message.
-2. Return only JSON in format:
-
-{{
-    "reason based on clause"
-}}
+### Instructions:
+- Answer clearly in one paragraph.
+- Do not mention clause numbers unless helpful.
+- If information is not found, say: "The policy document does not provide a clear answer to this question."
+- Return ONLY the answer text with no JSON, no markdown, and no extra formatting.
 """
 
     headers = {
@@ -173,20 +168,17 @@ You are a health insurance assistant. Based on the user query and the retrieved 
     }
 
     body = {
-        "model": "deepseek/deepseek-chat-v3-0324:free", 
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
+        "model": "deepseek/deepseek-chat-v3-0324:free",
+        "messages": [{"role": "user", "content": prompt}]
     }
 
     try:
-        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(body), timeout=30)
+        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=30)
         res.raise_for_status()
         response_text = res.json()['choices'][0]['message']['content']
-        return parse_json(response_text)
+        return response_text.strip()
     except Exception as e:
-        return {"error": str(e)}
-
+        return f"Error: {str(e)}"
 
 def parse_json(text):
     try:
@@ -213,10 +205,7 @@ def run_handler(request: RunRequest, authorization: str = Header(...)):
 
         def handle_question(q):
             context = "\n\n".join(get_top_k_chunks(q, chunks, index))
-            result = generate_decision(q, context)
-            if "error" in result:
-                return f"Error: {result.get('error', result.get('raw'))}"
-            return result
+            return generate_decision(q, context)
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(handle_question, request.questions))
