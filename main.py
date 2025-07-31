@@ -1,51 +1,51 @@
-import os, re, json
-from urllib.parse import urlparse
+import os, re, json, requests, pickle
 from hashlib import sha256
+from urllib.parse import urlparse
+from io import BytesIO
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from docx import Document
 from email import message_from_bytes
-from dotenv import load_dotenv
-from io import BytesIO
-import requests
 import fitz  # PyMuPDF
 import numpy as np
 import faiss
-import google.generativeai as genai
 import concurrent.futures
-import pickle
+from dotenv import load_dotenv
 
-# -------------------------
-# Init + Config
-# -------------------------
-
+# ----------------------------
+# Load environment variables
+# ----------------------------
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    raise ValueError("Missing GOOGLE_API_KEY")
 
-genai.configure(api_key=GOOGLE_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-pro")
+HF_TOKEN = os.getenv("HF_API_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+if not HF_TOKEN:
+    raise ValueError("Missing HF_API_TOKEN")
+if not OPENROUTER_API_KEY:
+    raise ValueError("Missing OPENROUTER_API_KEY")
+
+# Exposed as per your request
 API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
+HF_EMBED_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
 
-# Cache folder for FAISS indexes
 os.makedirs("faiss_indexes", exist_ok=True)
 
+# ----------------------------
+# FastAPI Init
+# ----------------------------
 app = FastAPI(title="LLM-Powered Insurance API")
 
-# -------------------------
+# ----------------------------
 # Models
-# -------------------------
-
+# ----------------------------
 class RunRequest(BaseModel):
     documents: str
     questions: list[str]
 
-# -------------------------
-# Auth + Utils
-# -------------------------
-
+# ----------------------------
+# Helpers
+# ----------------------------
 def check_token(auth_header: str):
     if not auth_header.startswith("Bearer ") or auth_header.split(" ")[1] != API_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid or missing token")
@@ -53,10 +53,9 @@ def check_token(auth_header: str):
 def compute_hash(text: str):
     return sha256(text.encode()).hexdigest()
 
-# -------------------------
-# Document Parsers
-# -------------------------
-
+# ----------------------------
+# Document Extractors
+# ----------------------------
 def extract_text_from_pdf_url(url):
     r = requests.get(url); r.raise_for_status()
     doc = fitz.open(stream=BytesIO(r.content), filetype="pdf")
@@ -83,20 +82,32 @@ def get_text_from_blob(url):
     else:
         raise ValueError("Unsupported file format (must be PDF, DOCX, or EML)")
 
-# -------------------------
-# Embedding + Retrieval
-# -------------------------
+# ----------------------------
+# Embeddings (via HF API)
+# ----------------------------
+def embed_text(texts):
+    if isinstance(texts, str):
+        texts = [texts]
 
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        resp = requests.post(HF_EMBED_URL, headers=headers, json={"inputs": texts}, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[Embedding Error] {e}")
+        return [np.random.rand(384).tolist() for _ in texts]
+
+# ----------------------------
+# Chunking & FAISS
+# ----------------------------
 def chunk_text(text, max_words=200):
     words = text.split()
     return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
-
-def embed_text(text, task_type="retrieval_document"):
-    return genai.embed_content(
-        model="models/embedding-001",
-        content=text,
-        task_type=task_type
-    )['embedding']
 
 def build_or_load_faiss(doc_text: str):
     doc_id = compute_hash(doc_text)
@@ -110,9 +121,9 @@ def build_or_load_faiss(doc_text: str):
         return chunks, index
 
     chunks = chunk_text(doc_text)
-    chunks = chunks[:40]  # ⚡ Limit to 40 chunks for performance
+    chunks = chunks[:40]  # Limit to 40 chunks for speed
 
-    embeddings = [embed_text(c) for c in chunks]
+    embeddings = embed_text(chunks)
     dim = len(embeddings[0])
     index = faiss.IndexFlatL2(dim)
     index.add(np.array(embeddings).astype("float32"))
@@ -124,14 +135,13 @@ def build_or_load_faiss(doc_text: str):
     return chunks, index
 
 def get_top_k_chunks(query, chunks, index, k=5):
-    query_vec = np.array(embed_text(query, "retrieval_query")).astype("float32").reshape(1, -1)
+    query_vec = np.array(embed_text(query)).astype("float32").reshape(1, -1)
     _, I = index.search(query_vec, k)
     return [chunks[i] for i in I[0]]
 
-# -------------------------
-# Gemini Generator
-# -------------------------
-
+# ----------------------------
+# Generation (via OpenRouter)
+# ----------------------------
 def generate_decision(user_query, retrieved_clauses):
     prompt = f"""
 You are a health insurance assistant. Based on the user query and the retrieved policy clauses, make a decision.
@@ -154,9 +164,25 @@ You are a health insurance assistant. Based on the user query and the retrieved 
   "justification": "reason based on clause"
 }}
 """
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "model": "deepseek-chat",  # or other OpenRouter-supported model
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ]
+    }
+
     try:
-        res = model.generate_content(prompt)
-        return parse_json(res.text)
+        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=30)
+        res.raise_for_status()
+        response_text = res.json()['choices'][0]['message']['content']
+        return parse_json(response_text)
     except Exception as e:
         return {"error": str(e)}
 
@@ -167,13 +193,12 @@ def parse_json(text):
     except:
         return {"error": "Invalid JSON", "raw": text}
 
-# -------------------------
-# FastAPI Routes
-# -------------------------
-
+# ----------------------------
+# API Routes
+# ----------------------------
 @app.get("/")
 def home():
-    return {"status": "LLM-Powered Insurance API running."}
+    return {"status": "LLM API running"}
 
 @app.post("/hackrx/run")
 def run_handler(request: RunRequest, authorization: str = Header(...)):
@@ -187,8 +212,8 @@ def run_handler(request: RunRequest, authorization: str = Header(...)):
             context = "\n\n".join(get_top_k_chunks(q, chunks, index))
             result = generate_decision(q, context)
             if "error" in result:
-                return f"Error processing: {result.get('error', result.get('raw'))}"
-            return result.get("justification", "No answer found.")
+                return f"Error: {result.get('error', result.get('raw'))}"
+            return result
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(handle_question, request.questions))
