@@ -9,6 +9,7 @@ from email import message_from_bytes
 import fitz  # PyMuPDF
 import numpy as np
 import faiss
+import google.generativeai as genai
 import concurrent.futures
 from dotenv import load_dotenv
 
@@ -17,13 +18,16 @@ from dotenv import load_dotenv
 # ----------------------------
 load_dotenv()
 
-HF_TOKEN = os.getenv("HF_API_TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-if not HF_TOKEN:
-    raise ValueError("Missing HF_API_TOKEN")
+if not GOOGLE_API_KEY:
+    raise ValueError("Missing GOOGLE_API_KEY")
 if not OPENROUTER_API_KEY:
     raise ValueError("Missing OPENROUTER_API_KEY")
+
+# Configure Google's Generative AI
+genai.configure(api_key=GOOGLE_API_KEY)
 
 # Exposed as per your request
 API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
@@ -82,28 +86,21 @@ def get_text_from_blob(url):
         raise ValueError("Unsupported file format (must be PDF, DOCX, or EML)")
 
 # ----------------------------
-# Embeddings (via HF API)
+# Embeddings (via Google API)
 # ----------------------------
-def embed_text(texts):
-    if isinstance(texts, str):
-        texts = [texts]
-
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction"
-
-    try:
-        response = requests.post(API_URL, headers=headers, json={"inputs": texts}, timeout=15)
-        response.raise_for_status()
-        return response.json()  # returns list of embeddings
-    except Exception as e:
-        print(f"[Embedding Error] {e}")
-        # Fallback: generate random vector with same dim
-        return [np.random.rand(384).tolist() for _ in texts]
-
+def embed_text(text, task_type="retrieval_document"):
+    if isinstance(text, list):
+        return [genai.embed_content(
+            model="models/embedding-001",
+            content=t,
+            task_type=task_type
+        )['embedding'] for t in text]
+    else:
+        return genai.embed_content(
+            model="models/embedding-001",
+            content=text,
+            task_type=task_type
+        )['embedding']
 
 # ----------------------------
 # Chunking & FAISS
@@ -138,12 +135,12 @@ def build_or_load_faiss(doc_text: str):
     return chunks, index
 
 def get_top_k_chunks(query, chunks, index, k=5):
-    query_vec = np.array(embed_text(query)).astype("float32").reshape(1, -1)
+    query_vec = np.array(embed_text(query, "retrieval_query")).astype("float32").reshape(1, -1)
     _, I = index.search(query_vec, k)
     return [chunks[i] for i in I[0]]
 
 # ----------------------------
-# Generation (via OpenRouter)
+# Generation (via OpenRouter DeepSeek)
 # ----------------------------
 def generate_decision(user_query, retrieved_clauses):
     prompt = f"""
@@ -156,7 +153,7 @@ You are a health insurance assistant. Read the user's query and the policy claus
 {retrieved_clauses}
 
 ### Instructions:
-- Answer clearly in one paragraph.
+- Answer clearly in one line for each question.
 - Do not mention clause numbers unless helpful.
 - If information is not found, say: "The policy document does not provide a clear answer to this question."
 - Return ONLY the answer text with no JSON, no markdown, and no extra formatting.
@@ -179,13 +176,6 @@ You are a health insurance assistant. Read the user's query and the policy claus
         return response_text.strip()
     except Exception as e:
         return f"Error: {str(e)}"
-
-def parse_json(text):
-    try:
-        json_str = re.search(r'{.*}', text, re.DOTALL).group()
-        return json.loads(json_str)
-    except:
-        return {"error": "Invalid JSON", "raw": text}
 
 # ----------------------------
 # API Routes
