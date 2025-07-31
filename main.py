@@ -12,6 +12,7 @@ import faiss
 import google.generativeai as genai
 import concurrent.futures
 from dotenv import load_dotenv
+from groq import Groq
 
 # ----------------------------
 # Load environment variables
@@ -19,17 +20,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GOOGLE_API_KEY:
     raise ValueError("Missing GOOGLE_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise ValueError("Missing OPENROUTER_API_KEY")
+if not GROQ_API_KEY:
+    raise ValueError("Missing GROQ_API_KEY")
 
-# Configure Google's Generative AI
+# Configure APIs
 genai.configure(api_key=GOOGLE_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Exposed as per your request
+# API token for FastAPI authentication
 API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
 
 os.makedirs("faiss_indexes", exist_ok=True)
@@ -140,7 +142,7 @@ def get_top_k_chunks(query, chunks, index, k=5):
     return [chunks[i] for i in I[0]]
 
 # ----------------------------
-# Generation (via OpenRouter DeepSeek)
+# Generation (via Groq API - Llama 3 70B)
 # ----------------------------
 def generate_decision(user_query, retrieved_clauses):
     prompt = f"""
@@ -153,27 +155,29 @@ You are a health insurance assistant. Read the user's query and the policy claus
 {retrieved_clauses}
 
 ### Instructions:
-- Answer clearly in one line for each question.
-- Do not mention clause numbers unless helpful.
+- Answer clearly in one paragraph
+- Do not mention clause numbers unless helpful
 - If information is not found, say: "The policy document does not provide a clear answer to this question."
-- Return ONLY the answer text with no JSON, no markdown, and no extra formatting.
+- Return ONLY the answer text with no JSON, no markdown, and no extra formatting
 """
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    body = {
-        "model": "deepseek/deepseek-chat-v3-0324:free",
-        "messages": [{"role": "user", "content": prompt}]
-    }
-
     try:
-        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=30)
-        res.raise_for_status()
-        response_text = res.json()['choices'][0]['message']['content']
-        return response_text.strip()
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful insurance policy assistant that provides clear, concise answers based on provided documentation."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            model="llama3-70b-8192",
+            temperature=0.3,
+            max_tokens=1024
+        )
+        return chat_completion.choices[0].message.content.strip()
     except Exception as e:
         return f"Error: {str(e)}"
 
