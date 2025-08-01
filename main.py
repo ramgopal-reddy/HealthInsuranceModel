@@ -170,6 +170,7 @@ def parse_json(text):
 # -------------------------
 
 @app.get("/")
+@app.head("/")
 def home():
     return {"status": "LLM-Powered Insurance API running."}
 
