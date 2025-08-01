@@ -1,4 +1,3 @@
-@ -1,200 +1,200 @@
 import os, re, json
 from urllib.parse import urlparse
 from hashlib import sha256
@@ -150,10 +149,8 @@ You are a health insurance assistant. Based on the user query and the retrieved 
 4. Return only JSON in format:
 
 {{
-  "decision": "approved/rejected",
-  "amount": "if mentioned",
   "justification": "reason based on clause"
-}}
+ }}
 """
     try:
         res = model.generate_content(prompt)
