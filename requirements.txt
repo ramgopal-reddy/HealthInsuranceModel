@@ -1,12 +1,11 @@
 fastapi
 uvicorn
+pydantic
 python-docx
-pymupdf
-faiss-cpu
-python-dotenv
 requests
+PyMuPDF
 numpy
+faiss-cpu
 google-generativeai
-scikit-learn
-groq
-nltk
+python-dotenv
+concurrent-log-handler

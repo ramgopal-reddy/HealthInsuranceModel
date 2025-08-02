@@ -1,4 +1,7 @@
-import os, re, json
+import os
+import re
+import json
+import logging
 from urllib.parse import urlparse
 from hashlib import sha256
 from fastapi import FastAPI, HTTPException, Header
@@ -14,15 +17,9 @@ import faiss
 import google.generativeai as genai
 import concurrent.futures
 import pickle
-from typing import List, Dict, Optional
-from nltk.tokenize import sent_tokenize
-import nltk
-
-# Download NLTK data (run once)
-nltk.download('punkt')
 
 # -------------------------
-# Enhanced Configuration
+# Init + Config
 # -------------------------
 
 load_dotenv()
@@ -31,280 +28,178 @@ if not GOOGLE_API_KEY:
     raise ValueError("Missing GOOGLE_API_KEY")
 
 genai.configure(api_key=GOOGLE_API_KEY)
-# Using a more capable model for better accuracy
-model = genai.GenerativeModel("gemini-1.5-pro")
+model = genai.GenerativeModel("gemini-2.5-flash")
 
-API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
+API_TOKEN = os.getenv("API_TOKEN", "default_token")
 
 # Cache folder for FAISS indexes
 os.makedirs("faiss_indexes", exist_ok=True)
 
-app = FastAPI(title="Enhanced LLM-Powered Insurance API")
+app = FastAPI(title="LLM-Powered Insurance API")
 
 # -------------------------
-# Enhanced Models
+# Models
 # -------------------------
 
 class RunRequest(BaseModel):
     documents: str
-    questions: List[str]
-    policy_type: Optional[str] = "health"  # Added policy type for better context
+    questions: list[str]
 
 # -------------------------
-# Enhanced Document Processing
+# Auth + Utils
 # -------------------------
 
-def semantic_chunking(text: str, max_length: int = 500) -> List[str]:
-    """Improved chunking that preserves semantic boundaries"""
-    sentences = sent_tokenize(text)
-    chunks = []
-    current_chunk = []
-    current_length = 0
-    
-    for sentence in sentences:
-        sentence_length = len(sentence.split())
-        if current_length + sentence_length > max_length and current_chunk:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = []
-            current_length = 0
-        current_chunk.append(sentence)
-        current_length += sentence_length
-    
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-    
-    return chunks
+def check_token(auth_header: str):
+    if not auth_header.startswith("Bearer ") or auth_header.split(" ")[1] != API_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing token")
 
-def clean_text(text: str) -> str:
-    """Clean and normalize text for better processing"""
-    # Remove excessive whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-    # Remove header/footer artifacts
-    text = re.sub(r'Page \d+ of \d+', '', text)
-    return text
+def compute_hash(text: str):
+    return sha256(text.encode()).hexdigest()
 
 # -------------------------
-# Enhanced Embedding + Retrieval
+# Document Parsers
 # -------------------------
 
-def embed_text_batch(texts: List[str], task_type: str = "retrieval_document") -> List[List[float]]:
-    """Batch process embeddings for efficiency"""
-    # Gemini's embedding API has limits, so we process in batches
-    batch_size = 10
-    embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        response = genai.embed_content(
-            model="models/embedding-001",
-            content=batch,
-            task_type=task_type
-        )
-        embeddings.extend(response['embedding'])
-    return embeddings
+def extract_text_from_pdf_url(url):
+    r = requests.get(url); r.raise_for_status()
+    doc = fitz.open(stream=BytesIO(r.content), filetype="pdf")
+    return "\n".join(page.get_text() for page in doc)
 
-def build_enhanced_faiss_index(doc_text: str) -> tuple:
-    """Build a more sophisticated FAISS index with metadata"""
+def extract_text_from_docx_url(url):
+    r = requests.get(url); r.raise_for_status()
+    doc = Document(BytesIO(r.content))
+    return "\n".join(para.text for para in doc.paragraphs)
+
+def extract_text_from_eml_url(url):
+    r = requests.get(url); r.raise_for_status()
+    msg = message_from_bytes(r.content)
+    return msg.get_payload()
+
+def get_text_from_blob(url):
+    path = urlparse(url).path.lower()
+    if path.endswith(".pdf"):
+        return extract_text_from_pdf_url(url)
+    elif path.endswith(".docx"):
+        return extract_text_from_docx_url(url)
+    elif path.endswith(".eml"):
+        return extract_text_from_eml_url(url)
+    else:
+        raise ValueError("Unsupported file format (must be PDF, DOCX, or EML)")
+
+# -------------------------
+# Embedding + Retrieval
+# -------------------------
+
+def chunk_text(text, max_words=200):
+    words = text.split()
+    return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
+
+def embed_text(text, task_type="retrieval_document"):
+    return genai.embed_content(
+        model="models/embedding-001",
+        content=text,
+        task_type=task_type
+    )['embedding']
+
+def build_or_load_faiss(doc_text: str):
     doc_id = compute_hash(doc_text)
     index_file = f"faiss_indexes/{doc_id}.index"
     chunks_file = f"faiss_indexes/{doc_id}_chunks.pkl"
-    metadata_file = f"faiss_indexes/{doc_id}_meta.pkl"
 
     if os.path.exists(index_file) and os.path.exists(chunks_file):
         index = faiss.read_index(index_file)
         with open(chunks_file, "rb") as f:
             chunks = pickle.load(f)
-        with open(metadata_file, "rb") as f:
-            metadata = pickle.load(f)
-        return chunks, index, metadata
+        return chunks, index
 
-    # Enhanced preprocessing
-    cleaned_text = clean_text(doc_text)
-    chunks = semantic_chunking(cleaned_text)
-    
-    # Generate embeddings in batches for efficiency
-    embeddings = embed_text_batch(chunks)
-    
-    # Add metadata about each chunk (position in document)
-    metadata = [{"position": i, "length": len(chunk)} for i, chunk in enumerate(chunks)]
-    
-    # Build FAISS index
+    chunks = chunk_text(doc_text)
+    chunks = chunks[:40]  # ⚡ Limit to 40 chunks for performance
+
+    embeddings = [embed_text(c) for c in chunks]
     dim = len(embeddings[0])
-    index = faiss.IndexFlatIP(dim)  # Using Inner Product for better similarity
+    index = faiss.IndexIVFFlat(dim, 10)  # Use a more efficient index
+    index.train(np.array(embeddings).astype("float32"))
     index.add(np.array(embeddings).astype("float32"))
-    
-    # Save everything
+
     faiss.write_index(index, index_file)
     with open(chunks_file, "wb") as f:
         pickle.dump(chunks, f)
-    with open(metadata_file, "wb") as f:
-        pickle.dump(metadata, f)
-    
-    return chunks, index, metadata
 
-def get_relevant_chunks(query: str, chunks: List[str], index, metadata: List[Dict], k: int = 5) -> List[str]:
-    """Enhanced retrieval with score thresholding"""
-    query_vec = np.array(embed_text_batch([query], "retrieval_query")[0]).astype("float32").reshape(1, -1)
-    scores, indices = index.search(query_vec, k*2)  # Get more candidates for filtering
-    
-    # Filter by similarity score threshold
-    threshold = 0.7  # Adjusted based on testing
-    results = []
-    for score, idx in zip(scores[0], indices[0]):
-        if score > threshold and idx < len(chunks):
-            results.append({
-                "text": chunks[idx],
-                "score": float(score),
-                "position": metadata[idx]["position"]
-            })
-    
-    # Sort by position to maintain document flow
-    results.sort(key=lambda x: x["position"])
-    return [r["text"] for r in results[:k]]  # Return top k after filtering
+    return chunks, index
+
+def get_top_k_chunks(query, chunks, index, k=5):
+    query_vec = np.array(embed_text(query, "retrieval_query")).astype("float32").reshape(1, -1)
+    _, I = index.search(query_vec, k)
+    return [chunks[i] for i in I[0]]
 
 # -------------------------
-# Enhanced Decision Generation
+# Gemini Generator
 # -------------------------
 
-def generate_structured_decision(user_query: str, retrieved_clauses: List[str], policy_type: str) -> Dict:
-    """Enhanced decision generation with structured output"""
-    context = "\n\n".join([f"CLAUSE {i+1}:\n{clause}" for i, clause in enumerate(retrieved_clauses)])
-    
+def generate_decision(user_query, retrieved_clauses):
     prompt = f"""
-ROLE: You are a senior {policy_type} insurance claims adjuster with 20 years of experience.
-TASK: Evaluate the claim based on the policy documents and provide a detailed decision.
+You are a health insurance assistant. Based on the user query and the retrieved policy clauses, make a decision.
 
-POLICY DOCUMENT EXCERPTS:
-{context}
-
-CLAIM DETAILS:
+## User Query:
 {user_query}
 
-INSTRUCTIONS:
-1. Carefully analyze each relevant policy clause
-2. Determine coverage eligibility
-3. If covered, calculate the payable amount based on policy terms
-4. If not covered, specify the exact exclusion clause
-5. Provide clear justification referencing specific clauses
+## Retrieved Clauses:
+{retrieved_clauses}
 
-OUTPUT FORMAT (JSON):
+## Task:
+1. Decide if the case should be APPROVED or REJECTED.
+2. If approved, specify payout amount if mentioned.
+3. Justify using exact clause references.
+4. Return only JSON in format:
+
 {{
-  "decision": "APPROVED|REJECTED|PENDING",
-  "amount": float|null,
-  "currency": "USD|EUR|etc"|null,
-  "justification": "Detailed explanation referencing clauses",
-  "clauses_used": ["list of clause numbers referenced"],
-  "confidence": "HIGH|MEDIUM|LOW"
-}}
+  "justification": "reason based on clause"
+ }}
 """
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.2,  # Lower for more deterministic outputs
-                "max_output_tokens": 1024
-            }
-        )
-        result = parse_enhanced_json(response.text)
-        
-        # Validation layer
-        if not validate_decision(result):
-            raise ValueError("Invalid decision format")
-            
-        return result
+        res = model.generate_content(prompt)
+        return parse_json(res.text)
     except Exception as e:
-        return {
-            "error": str(e),
-            "fallback_decision": {
-                "decision": "PENDING",
-                "justification": "System error - requires manual review",
-                "confidence": "LOW"
-            }
-        }
+        logging.error(f"Error generating decision: {str(e)}")
+        return {"error": str(e)}
 
-def parse_enhanced_json(text: str) -> Dict:
-    """More robust JSON parsing"""
+def parse_json(text):
     try:
-        # Handle common formatting issues
-        text = text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(text)
-        
-        # Ensure required fields
-        if "decision" not in data:
-            raise ValueError("Missing decision field")
-            
-        return data
-    except json.JSONDecodeError:
-        # Fallback parsing for malformed JSON
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except:
-                pass
-        return {"error": "Invalid JSON format", "raw": text}
-
-def validate_decision(decision: Dict) -> bool:
-    """Validate the decision structure"""
-    required_fields = ["decision", "justification"]
-    if not all(field in decision for field in required_fields):
-        return False
-        
-    if decision["decision"] not in ["APPROVED", "REJECTED", "PENDING"]:
-        return False
-        
-    return True
+        json_str = re.search(r'{.*}', text, re.DOTALL).group()
+        return json.loads(json_str)
+    except Exception as e:
+        logging.error(f"Error parsing JSON: {str(e)}")
+        return {"error": "Invalid JSON", "raw": text}
 
 # -------------------------
-# Enhanced API Endpoints
+# FastAPI Routes
 # -------------------------
+
+@app.get("/")
+@app.head("/")
+def home():
+    return {"status": "LLM-Powered Insurance API running."}
 
 @app.post("/hackrx/run")
-def enhanced_run_handler(request: RunRequest, authorization: str = Header(...)):
+def run_handler(request: RunRequest, authorization: str = Header(...)):
     check_token(authorization)
 
     try:
-        # Get and process document
         text = get_text_from_blob(request.documents)
-        chunks, index, metadata = build_enhanced_faiss_index(text)
+        chunks, index = build_or_load_faiss(text)
 
-        def process_question(q: str) -> Dict:
-            # Enhanced retrieval
-            context_chunks = get_relevant_chunks(q, chunks, index, metadata, k=5)
-            
-            # Generate structured decision
-            decision = generate_structured_decision(q, context_chunks, request.policy_type)
-            
-            # Error handling fallback
-            if "error" in decision:
-                return {
-                    "question": q,
-                    "error": decision["error"],
-                    "fallback": decision.get("fallback_decision", {}),
-                    "status": "error"
-                }
-            return {
-                "question": q,
-                "response": decision,
-                "status": "success"
-            }
+        def handle_question(q):
+            context = "\n\n".join(get_top_k_chunks(q, chunks, index))
+            result = generate_decision(q, context)
+            if "error" in result:
+                return f"Error processing: {result.get('error', result.get('raw'))}"
+            return result.get("justification", "No answer found.")
 
-        # Process questions in parallel with error handling
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            results = list(executor.map(process_question, request.questions))
+            results = list(executor.map(handle_question, request.questions))
 
-        return {
-            "results": results,
-            "document_hash": compute_hash(text),
-            "chunks_processed": len(chunks)
-        }
+        return {"answers": results}
 
-    except requests.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Document download error: {str(e)}")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": str(e),
-                "solution": "Please check the document format and try again"
-            }
-        )
+        logging.error(f"Error in run_handler: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
