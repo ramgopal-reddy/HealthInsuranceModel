@@ -117,15 +117,22 @@ def build_or_load_faiss(doc_text: str):
 
     embeddings = [embed_text(c) for c in chunks]
     dim = len(embeddings[0])
-    index = faiss.IndexIVFFlat(dim, 10)  # Use a more efficient index
-    index.train(np.array(embeddings).astype("float32"))
-    index.add(np.array(embeddings).astype("float32"))
+    
+    # Create a base index
+    base_index = faiss.IndexFlatL2(dim)  # Base index for IVFFlat
+    nlist = 10  # Number of clusters (this can be tuned)
+    
+    # Create the IVFFlat index
+    index = faiss.IndexIVFFlat(base_index, dim, nlist)
+    index.train(np.array(embeddings).astype("float32"))  # Train the index with the embeddings
+    index.add(np.array(embeddings).astype("float32"))  # Add the embeddings to the index
 
     faiss.write_index(index, index_file)
     with open(chunks_file, "wb") as f:
         pickle.dump(chunks, f)
 
     return chunks, index
+
 
 def get_top_k_chunks(query, chunks, index, k=5):
     query_vec = np.array(embed_text(query, "retrieval_query")).astype("float32").reshape(1, -1)
