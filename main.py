@@ -1,7 +1,4 @@
-import os
-import re
-import json
-import logging
+import os, re, json
 from urllib.parse import urlparse
 from hashlib import sha256
 from fastapi import FastAPI, HTTPException, Header
@@ -30,7 +27,7 @@ if not GOOGLE_API_KEY:
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
-API_TOKEN = os.getenv("API_TOKEN", "default_token")
+API_TOKEN = "b3e3b79e7611d2b1b66a032cee801cfb7481c8b537337fd7c3c5ab6a78c5b8b7"
 
 # Cache folder for FAISS indexes
 os.makedirs("faiss_indexes", exist_ok=True)
@@ -117,22 +114,14 @@ def build_or_load_faiss(doc_text: str):
 
     embeddings = [embed_text(c) for c in chunks]
     dim = len(embeddings[0])
-    
-    # Create a base index
-    base_index = faiss.IndexFlatL2(dim)  # Base index for IVFFlat
-    nlist = 10  # Number of clusters (this can be tuned)
-    
-    # Create the IVFFlat index
-    index = faiss.IndexIVFFlat(base_index, dim, nlist)
-    index.train(np.array(embeddings).astype("float32"))  # Train the index with the embeddings
-    index.add(np.array(embeddings).astype("float32"))  # Add the embeddings to the index
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(embeddings).astype("float32"))
 
     faiss.write_index(index, index_file)
     with open(chunks_file, "wb") as f:
         pickle.dump(chunks, f)
 
     return chunks, index
-
 
 def get_top_k_chunks(query, chunks, index, k=5):
     query_vec = np.array(embed_text(query, "retrieval_query")).astype("float32").reshape(1, -1)
@@ -145,7 +134,7 @@ def get_top_k_chunks(query, chunks, index, k=5):
 
 def generate_decision(user_query, retrieved_clauses):
     prompt = f"""
-You are a health insurance assistant. Based on the user query and the retrieved policy clauses, make a decision.
+You are a knowledgeable health insurance assistant. Given the user query and the retrieved policy clauses, provide a clear justification based on the clauses.
 
 ## User Query:
 {user_query}
@@ -154,28 +143,26 @@ You are a health insurance assistant. Based on the user query and the retrieved 
 {retrieved_clauses}
 
 ## Task:
-1. Decide if the case should be APPROVED or REJECTED.
-2. If approved, specify payout amount if mentioned.
-3. Justify using exact clause references.
-4. Return only JSON in format:
+- Analyze the query and match it with the most relevant clause(s).
+- Return only a justification or reason that supports or denies the query, citing exact clause references when possible.
+- Respond only with a JSON object in the following format:
 
 {{
-  "justification": "reason based on clause"
- }}
+  "justification": "Your reason based on the specific policy clause(s)"
+}}
 """
+
     try:
         res = model.generate_content(prompt)
         return parse_json(res.text)
     except Exception as e:
-        logging.error(f"Error generating decision: {str(e)}")
         return {"error": str(e)}
 
 def parse_json(text):
     try:
         json_str = re.search(r'{.*}', text, re.DOTALL).group()
         return json.loads(json_str)
-    except Exception as e:
-        logging.error(f"Error parsing JSON: {str(e)}")
+    except:
         return {"error": "Invalid JSON", "raw": text}
 
 # -------------------------
@@ -208,5 +195,4 @@ def run_handler(request: RunRequest, authorization: str = Header(...)):
         return {"answers": results}
 
     except Exception as e:
-        logging.error(f"Error in run_handler: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
