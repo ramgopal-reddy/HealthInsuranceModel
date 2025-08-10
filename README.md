@@ -73,13 +73,7 @@ ClausePilot is an **Intelligent Retrieval-Augmented Generation (RAG) system** th
 
 ```
 ClausePilot/
-├── app/
-│   ├── main.py              # FastAPI entrypoint
-│   ├── parsing.py           # Document parsing functions
-│   ├── embeddings.py        # Embedding generation logic
-│   ├── retrieval.py         # FAISS search & RAG pipeline
-│   ├── generation.py        # LLM answer synthesis
-│   └── utils.py             # Helper utilities
+├── main.py
 ├── requirements.txt
 └── README.md
 ```
@@ -91,8 +85,8 @@ ClausePilot/
 ### 1️⃣ Clone the repo
 
 ```bash
-git clone https://github.com/your-username/clausepilot-hackrx.git
-cd clausepilot-hackrx
+git clone https://github.com/ramgopal-reddy/HealthInsuranceModel.git
+cd HealthInsuranceModel
 ```
 
 ### 2️⃣ Install dependencies
@@ -115,13 +109,13 @@ GEMINI_API_KEY=your_gemini_api_key_here
 uvicorn app.main:app --reload
 ```
 
-API will be live at: `http://127.0.0.1:8000`
+API will be live at: `http://127.0.0.1:8000` (similar)
 
 ---
 
 ## 📬 API Usage
 
-**POST** `/process_document`  
+**POST** `/hackrx/run`  
 Send:
 
 ```json
@@ -148,11 +142,10 @@ Returns:
 
 ---
 
-## 🧑‍💻 Team – _The Synaptics_
+## 🧑‍💻 Team –
 
 - **Lead AI/ML Engineer** – Architected RAG pipeline & optimized embeddings.
 - **Backend & API Developer** – Built scalable, low-latency FastAPI service.
-- **Product & Strategy Lead** – Ensured explainability & enterprise relevance.
 
 ---
 
